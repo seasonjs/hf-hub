@@ -2,11 +2,16 @@ package api
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/schollz/progressbar/v3"
+	"io"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"text/template"
 )
@@ -37,7 +42,8 @@ func NewCache(path string) *Cache {
 func DefaultCache() (*Cache, error) {
 	homePath := os.Getenv("HF_HOME")
 	if len(homePath) == 0 {
-		homePath, err := os.UserHomeDir()
+		var err error
+		homePath, err = os.UserHomeDir()
 		if err != nil {
 			return nil, err
 		}
@@ -57,6 +63,12 @@ func (c *Cache) TokenPath() string {
 
 func (c *Cache) Token() (string, error) {
 	tokenPath := c.TokenPath()
+
+	if _, err := os.Stat(tokenPath); os.IsNotExist(err) {
+		log.Println("Token file not found")
+		return "", nil
+	}
+
 	file, err := os.ReadFile(tokenPath)
 	if err != nil {
 		return "", err
@@ -131,8 +143,25 @@ func (r *CacheRepo) refPath() string {
 	return filepath.Join(path, "refs", r.repo.Revision())
 }
 
-func (r *CacheRepo) PointerPath(etag string) string {
+func (r *CacheRepo) CreateRef(commitHash string) error {
+	refPath := r.refPath()
+	err := os.MkdirAll(filepath.Dir(refPath), os.ModePerm)
+	if err != nil {
+		return err
+	}
+	err = os.WriteFile(refPath, []byte(commitHash), os.ModePerm)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (r *CacheRepo) BlobPath(etag string) string {
 	return filepath.Join(r.path(), "blobs", etag)
+}
+
+func (r *CacheRepo) PointerPath(commitHash string) string {
+	return filepath.Join(r.path(), "snapshots", commitHash)
 }
 
 type Repo struct {
@@ -239,6 +268,11 @@ func (b *ApiBuilder) FromCache(cache *Cache) (*ApiBuilder, error) {
 	}, nil
 }
 
+func (b *ApiBuilder) WithEndpoint(endpoint string) *ApiBuilder {
+	b.endpoint = endpoint
+	return b
+}
+
 func (b *ApiBuilder) WithProgress(progress bool) *ApiBuilder {
 	b.progress = progress
 	return b
@@ -281,6 +315,9 @@ func (b *ApiBuilder) Build() *Api {
 }
 
 type Metadata struct {
+	commitHash string
+	etag       string
+	size       uint64
 }
 
 type Api struct {
@@ -301,6 +338,80 @@ func NewApi() (*Api, error) {
 	return api, nil
 }
 
+func (a *Api) metadata(url string) (*Metadata, error) {
+	req, err := http.NewRequest(http.MethodPost, url, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Add("Range", "bytes=0-0")
+	res, err := a.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+
+	commitHash := res.Header.Get("x-repo-commit")
+	if len(commitHash) == 0 {
+		return nil, errors.New("miss header")
+	}
+
+	etag := res.Header.Get("x-linked-etag")
+	etag = strings.ReplaceAll(etag, "\"", "")
+	if len(etag) == 0 {
+		return nil, errors.New("miss header")
+	}
+
+	contentRange := res.Header.Get("Content-Range")
+	contentRanges := strings.Split(contentRange, "/")
+	contentRange = contentRanges[len(contentRanges)-1]
+	if len(contentRange) == 0 {
+		return nil, errors.New("miss header")
+	}
+
+	size, err := strconv.ParseUint(contentRange, 10, 64)
+	if err != nil {
+		return nil, err
+	}
+
+	return &Metadata{
+		commitHash: commitHash,
+		etag:       etag,
+		size:       size,
+	}, nil
+}
+func (a *Api) downloadTempFile(url string, progressbar *progressbar.ProgressBar) (string, error) {
+	filename, err := a.cache.TempPath()
+	if err != nil {
+		return "", err
+	}
+
+	file, err := os.Create(filename)
+	if err != nil {
+		return "", err
+	}
+
+	defer file.Close()
+
+	res, err := a.client.Get(url)
+	if err != nil {
+		return "", err
+	}
+
+	var mw io.Writer
+
+	if progressbar != nil {
+		mw = io.MultiWriter(file, progressbar)
+	} else {
+		mw = file
+	}
+
+	_, err = io.Copy(mw, res.Body)
+	if err != nil {
+		return "", err
+	}
+
+	return filename, nil
+}
 func (a *Api) Repo(rep *Repo) *ApiRepo {
 	return NewApiRepo(a.Clone(), rep)
 }
@@ -377,9 +488,93 @@ func (r *ApiRepo) Get(filename string) (string, error) {
 }
 
 func (r *ApiRepo) Download(filename string) (string, error) {
-	//url, err := r.Url(filename)
-	//if err != nil {
-	//	return "", err
-	//}
-	panic("todo")
+	url, err := r.Url(filename)
+	if err != nil {
+		return "", err
+	}
+
+	metadata, err := r.api.metadata(url)
+	if err != nil {
+		return "", err
+	}
+
+	blobPath := r.api.cache.Repo(r.repo.Clone()).BlobPath(metadata.etag)
+
+	err = os.MkdirAll(filepath.Dir(blobPath), os.ModePerm)
+	if err != nil {
+		return "", err
+	}
+	var bar *progressbar.ProgressBar
+	if r.api.progress {
+		var message string
+		if len(filename) > 30 {
+			message = fmt.Sprintf("..%s", filename[:30])
+		} else {
+			message = filename
+		}
+		bar = progressbar.DefaultBytes(
+			int64(metadata.size),
+			message,
+		)
+	}
+
+	tmpFilename, err := r.api.downloadTempFile(url, bar)
+	if err != nil {
+		return "", err
+	}
+
+	err = os.Rename(tmpFilename, blobPath)
+	if err != nil {
+		return "", err
+	}
+
+	pointerPath := r.api.cache.Repo(r.repo.Clone()).PointerPath(metadata.commitHash)
+	pointerPath = filepath.Join(pointerPath, filename)
+
+	err = os.MkdirAll(filepath.Dir(pointerPath), os.ModePerm)
+	if err != nil {
+		return "", err
+	}
+
+	err = symlinkOrRename(blobPath, pointerPath)
+	if err != nil {
+		return "", err
+	}
+
+	err = r.api.cache.Repo(r.repo.Clone()).CreateRef(metadata.commitHash)
+	if err != nil {
+		return "", err
+	}
+
+	return pointerPath, nil
+}
+
+type Siblings struct {
+	Rfilename string `json:"rfilename"`
+}
+
+type RepoInfo struct {
+	Siblings []Siblings `json:"siblings"`
+	Sha      string     `json:"sha"`
+}
+
+func (r *ApiRepo) Info() (*RepoInfo, error) {
+	res, err := r.InfoRequest()
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+
+	var responseData RepoInfo
+	err = json.NewDecoder(res.Body).Decode(&responseData)
+	if err != nil {
+		return nil, err
+	}
+
+	return &responseData, nil
+}
+
+func (r *ApiRepo) InfoRequest() (*http.Response, error) {
+	url := fmt.Sprintf("%s/api/%s", r.api.endpoint, r.repo.ApiUrl())
+	return r.api.client.Get(url)
 }
