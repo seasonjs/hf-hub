@@ -38,7 +38,7 @@ func main() {
 ## Thanks
 
 * [huggingface_hub](https://github.com/huggingface/huggingface_hub)
-* [hf_hub](https://github.com/huggingface/hf_hub)
+* [hf-hub](https://github.com/huggingface/hf-hub)
 
 ## License
 
