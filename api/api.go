@@ -1,3 +1,6 @@
+// Copyright (c) seasonjs. All rights reserved.
+// Licensed under the MIT License. See License.txt in the project root for license information.
+
 package api
 
 import (
@@ -9,6 +12,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -122,13 +126,18 @@ func NewCacheRepo(cache *Cache, repo *Repo) *CacheRepo {
 
 func (r *CacheRepo) Get(filename string) (string, error) {
 	commitPath := r.refPath()
+	if _, err := os.Stat(commitPath); err != nil {
+		return "", err
+	}
+
 	commitHash, err := os.ReadFile(commitPath)
 	if err != nil {
-		return "", nil
+		return "", err
 	}
+
 	path := r.PointerPath(string(commitHash))
 	path = filepath.Join(path, filename)
-	if _, err = os.Stat(path); os.IsNotExist(err) {
+	if _, err = os.Stat(path); err != nil {
 		return "", err
 	}
 	return path, nil
@@ -200,9 +209,9 @@ func (r *Repo) FolderName() string {
 	var prefix string
 	switch r.repoType {
 	case Model:
-		prefix = "model"
+		prefix = "models"
 	case Dataset:
-		prefix = "dataset"
+		prefix = "datasets"
 	case Space:
 		prefix = "space"
 	}
@@ -215,6 +224,18 @@ func (r *Repo) Revision() string {
 	return r.revision
 }
 
+func (r *Repo) Url() string {
+	switch r.repoType {
+	case Model:
+		return r.repoId
+	case Dataset:
+		return fmt.Sprintf("datasets/%s", r.repoId)
+	case Space:
+		return fmt.Sprintf("spaces/%s", r.repoId)
+	}
+	return ""
+}
+
 func (r *Repo) UrlRevision() string {
 	return strings.ReplaceAll(r.revision, "/", "%2F")
 }
@@ -223,11 +244,11 @@ func (r *Repo) ApiUrl() string {
 	var prefix string
 	switch r.repoType {
 	case Model:
-		prefix = "model"
+		prefix = "models"
 	case Dataset:
-		prefix = "dataset"
+		prefix = "datasets"
 	case Space:
-		prefix = "space"
+		prefix = "spaces"
 	}
 	return fmt.Sprintf("%s/%s/revision/%s", prefix, r.repoId, r.UrlRevision())
 }
@@ -254,10 +275,22 @@ func NewApiBuilder() (*ApiBuilder, error) {
 }
 
 func (b *ApiBuilder) FromCache(cache *Cache) (*ApiBuilder, error) {
+	endpoint := os.Getenv("HF_ENDPOINT")
+	stagingMode := os.Getenv("HUGGINGFACE_CO_STAGING")
+	if len(endpoint) == 0 {
+		if len(stagingMode) > 0 && stagingMode == "true" {
+			endpoint = "https://hub-ci.huggingface.co"
+		} else {
+			endpoint = "https://huggingface.co"
+		}
+	}
+
 	token, err := cache.Token()
+
 	if err != nil {
 		return nil, err
 	}
+
 	return &ApiBuilder{
 		endpoint: "https://huggingface.co",
 		//"{endpoint}/{repo_id}/resolve/{revision}/{filename}"
@@ -302,14 +335,38 @@ func (b *ApiBuilder) BuildHeaders() http.Header {
 func (b *ApiBuilder) Build() *Api {
 	headers := b.BuildHeaders()
 	transport := &http.Transport{Proxy: http.ProxyFromEnvironment}
+	noCDNRedirectClient := &http.Client{
+		Transport: transport,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 10 {
+				return errors.New("stopped after 10 redirects")
+			}
+
+			if shouldRedirect(req.Response.StatusCode) {
+				location := req.Response.Header.Get("Location")
+				if location != "" && location[0] == '/' {
+					baseURL := req.URL
+					newURL, err := url.Parse(baseURL.Scheme + "://" + baseURL.Host + location)
+					if err != nil {
+						return err
+					}
+					req.URL = newURL
+					return nil
+				}
+			}
+
+			return http.ErrUseLastResponse
+		},
+	}
 	client := &http.Client{Transport: transport}
 	return &Api{
-		endpoint:    b.endpoint,
-		urlTemplate: b.urlTemplate,
-		cache:       b.cache,
-		headers:     headers,
-		client:      client,
-		progress:    b.progress,
+		endpoint:            b.endpoint,
+		urlTemplate:         b.urlTemplate,
+		cache:               b.cache,
+		headers:             headers,
+		client:              client,
+		noCDNRedirectClient: noCDNRedirectClient,
+		progress:            b.progress,
 	}
 
 }
@@ -321,12 +378,13 @@ type Metadata struct {
 }
 
 type Api struct {
-	endpoint    string
-	urlTemplate string
-	cache       *Cache
-	headers     http.Header
-	client      *http.Client
-	progress    bool
+	endpoint            string
+	urlTemplate         string
+	cache               *Cache
+	headers             http.Header
+	client              *http.Client
+	noCDNRedirectClient *http.Client
+	progress            bool
 }
 
 func NewApi() (*Api, error) {
@@ -339,33 +397,59 @@ func NewApi() (*Api, error) {
 }
 
 func (a *Api) metadata(url string) (*Metadata, error) {
-	req, err := http.NewRequest(http.MethodPost, url, nil)
+	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
 	}
 
+	req.Header = a.headers.Clone()
 	req.Header.Add("Range", "bytes=0-0")
-	res, err := a.client.Do(req)
+
+	res, err := a.noCDNRedirectClient.Do(req)
 	if err != nil {
 		return nil, err
+	}
+
+	if res.StatusCode > 400 {
+		return nil, errors.New(fmt.Sprintf("fail to get metadata, status code %d, status: %s", res.StatusCode, http.StatusText(res.StatusCode)))
 	}
 
 	commitHash := res.Header.Get("x-repo-commit")
 	if len(commitHash) == 0 {
-		return nil, errors.New("miss header")
+		return nil, errors.New("miss header commit-hash")
 	}
 
 	etag := res.Header.Get("x-linked-etag")
-	etag = strings.ReplaceAll(etag, "\"", "")
 	if len(etag) == 0 {
-		return nil, errors.New("miss header")
+		etag = res.Header.Get("etag")
+		if len(etag) == 0 {
+			return nil, errors.New("miss header etag")
+		}
+	}
+	etag = strings.ReplaceAll(etag, "\"", "")
+
+	if 300 <= res.StatusCode && res.StatusCode <= 400 {
+		location := res.Header.Get("Location")
+
+		req, err = http.NewRequest(http.MethodGet, location, nil)
+		if err != nil {
+			return nil, err
+		}
+
+		req.Header = a.headers.Clone()
+		req.Header.Add("Range", "bytes=0-0")
+		res, err = a.client.Do(req)
+
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	contentRange := res.Header.Get("Content-Range")
 	contentRanges := strings.Split(contentRange, "/")
 	contentRange = contentRanges[len(contentRanges)-1]
 	if len(contentRange) == 0 {
-		return nil, errors.New("miss header")
+		return nil, errors.New("miss header content-range")
 	}
 
 	size, err := strconv.ParseUint(contentRange, 10, 64)
@@ -386,13 +470,18 @@ func (a *Api) downloadTempFile(url string, progressbar *progressbar.ProgressBar)
 	}
 
 	file, err := os.Create(filename)
+	defer file.Close()
 	if err != nil {
 		return "", err
 	}
 
-	defer file.Close()
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return "", err
+	}
 
-	res, err := a.client.Get(url)
+	req.Header = a.headers.Clone()
+	res, err := a.client.Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -467,11 +556,10 @@ func (r *ApiRepo) Url(filename string) (string, error) {
 	//"{{.Endpoint}}/{{.RepoId}}/resolve/{{.Revision}}/{{.Filename}}",
 	err = t.Execute(&buf, UrlTemplateEntry{
 		Endpoint: r.api.endpoint,
-		RepoId:   r.repo.repoId,
-		Revision: r.repo.revision,
+		RepoId:   r.repo.Url(),
+		Revision: r.repo.UrlRevision(),
 		Filename: filename,
 	})
-
 	if err != nil {
 		return "", err
 	}
@@ -482,18 +570,21 @@ func (r *ApiRepo) Url(filename string) (string, error) {
 func (r *ApiRepo) Get(filename string) (string, error) {
 	path, err := r.api.cache.Repo(r.repo.Clone()).Get(filename)
 	if err != nil {
-		return r.Download(filename)
+		if os.IsNotExist(err) {
+			return r.Download(filename)
+		}
+		return "", err
 	}
 	return path, nil
 }
 
 func (r *ApiRepo) Download(filename string) (string, error) {
-	url, err := r.Url(filename)
+	apiUrl, err := r.Url(filename)
 	if err != nil {
 		return "", err
 	}
 
-	metadata, err := r.api.metadata(url)
+	metadata, err := r.api.metadata(apiUrl)
 	if err != nil {
 		return "", err
 	}
@@ -518,7 +609,7 @@ func (r *ApiRepo) Download(filename string) (string, error) {
 		)
 	}
 
-	tmpFilename, err := r.api.downloadTempFile(url, bar)
+	tmpFilename, err := r.api.downloadTempFile(apiUrl, bar)
 	if err != nil {
 		return "", err
 	}
@@ -560,10 +651,10 @@ type RepoInfo struct {
 
 func (r *ApiRepo) Info() (*RepoInfo, error) {
 	res, err := r.InfoRequest()
+	defer res.Body.Close()
 	if err != nil {
 		return nil, err
 	}
-	defer res.Body.Close()
 
 	var responseData RepoInfo
 	err = json.NewDecoder(res.Body).Decode(&responseData)
@@ -575,6 +666,6 @@ func (r *ApiRepo) Info() (*RepoInfo, error) {
 }
 
 func (r *ApiRepo) InfoRequest() (*http.Response, error) {
-	url := fmt.Sprintf("%s/api/%s", r.api.endpoint, r.repo.ApiUrl())
-	return r.api.client.Get(url)
+	apiUrl := fmt.Sprintf("%s/api/%s", r.api.endpoint, r.repo.ApiUrl())
+	return r.api.client.Get(apiUrl)
 }

@@ -1,7 +1,14 @@
+// Copyright (c) seasonjs. All rights reserved.
+// Licensed under the MIT License. See License.txt in the project root for license information.
+
 package api
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"io"
 	"math/rand"
+	"net/http"
 	"os"
 	"time"
 )
@@ -18,15 +25,14 @@ func randStr(length int) string {
 	return string(result)
 }
 
-//func makeRelative(src, dst string) (string, error) {
-//	path := src
-//	base := dst
-//
-//	if !filepath.IsAbs(path) || !filepath.IsAbs(base) {
-//		return "", errors.New("paths must be absolute paths only")
-//	}
-//
-//}
+func shouldRedirect(statusCode int) bool {
+	redirectStatusCodes := http.StatusMovedPermanently |
+		http.StatusFound |
+		http.StatusSeeOther |
+		http.StatusTemporaryRedirect |
+		http.StatusPermanentRedirect
+	return (redirectStatusCodes & statusCode) != 0
+}
 
 func symlinkOrRename(src, dst string) error {
 	if info, err := os.Stat(dst); err == nil && info != nil {
@@ -44,4 +50,18 @@ func symlinkOrRename(src, dst string) error {
 	}
 
 	return nil
+}
+
+func GetSHA256FromFile(path string) (string, error) {
+	f, err := os.Open(path)
+	defer f.Close()
+	if err != nil {
+		return "", err
+	}
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
