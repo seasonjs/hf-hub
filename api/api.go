@@ -470,10 +470,10 @@ func (a *Api) downloadTempFile(url string, progressbar *progressbar.ProgressBar)
 	}
 
 	file, err := os.Create(filename)
-	defer file.Close()
 	if err != nil {
 		return "", err
 	}
+	defer file.Close()
 
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
@@ -651,10 +651,10 @@ type RepoInfo struct {
 
 func (r *ApiRepo) Info() (*RepoInfo, error) {
 	res, err := r.InfoRequest()
-	defer res.Body.Close()
 	if err != nil {
 		return nil, err
 	}
+	defer res.Body.Close()
 
 	var responseData RepoInfo
 	err = json.NewDecoder(res.Body).Decode(&responseData)
