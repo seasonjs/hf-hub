@@ -1,4 +1,6 @@
 # hf-hub
+
+[![Go Reference](https://pkg.go.dev/badge/github.com/seasonjs/hf-hub.svg)](https://pkg.go.dev/github.com/seasonjs/hf-hub)
 golang client for the huggingface hub aiming for minimal subset of features over `huggingface-hub` python package
 
 ## Usage
