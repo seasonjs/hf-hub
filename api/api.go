@@ -140,7 +140,13 @@ func (r *CacheRepo) Get(filename string) (string, error) {
 	if _, err = os.Stat(path); err != nil {
 		return "", err
 	}
-	return path, nil
+
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+
+	return absPath, nil
 }
 
 func (r *CacheRepo) path() string {
@@ -213,7 +219,7 @@ func (r *Repo) FolderName() string {
 	case Dataset:
 		prefix = "datasets"
 	case Space:
-		prefix = "space"
+		prefix = "spaces"
 	}
 	result := fmt.Sprintf("%s--%s", prefix, r.repoId)
 	result = strings.ReplaceAll(result, "/", "--")
@@ -603,9 +609,11 @@ func (r *ApiRepo) Download(filename string) (string, error) {
 		} else {
 			message = filename
 		}
-		bar = progressbar.DefaultBytes(
+
+		bar = progressbar.NewOptions64(
 			int64(metadata.size),
-			message,
+			progressbar.OptionSetDescription(message),
+			progressbar.OptionUseANSICodes(useANSICodes),
 		)
 	}
 
@@ -637,7 +645,12 @@ func (r *ApiRepo) Download(filename string) (string, error) {
 		return "", err
 	}
 
-	return pointerPath, nil
+	absPointerPath, err := filepath.Abs(pointerPath)
+	if err != nil {
+		return "", err
+	}
+
+	return absPointerPath, nil
 }
 
 type Siblings struct {

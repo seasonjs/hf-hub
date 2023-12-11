@@ -34,24 +34,6 @@ func shouldRedirect(statusCode int) bool {
 	return (redirectStatusCodes & statusCode) != 0
 }
 
-func symlinkOrRename(src, dst string) error {
-	if info, err := os.Stat(dst); err == nil && info != nil {
-		return nil
-	}
-
-	//relSrc := makeRelative(src, dst)
-
-	err := os.Symlink(src, dst)
-	if err != nil && !os.IsExist(err) {
-		err = os.Rename(src, dst)
-		if err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
 func GetSHA256FromFile(path string) (string, error) {
 	f, err := os.Open(path)
 	defer f.Close()
