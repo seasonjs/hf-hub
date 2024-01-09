@@ -11,7 +11,7 @@ def main():
         filename="config.json",
         revision="main",
         cache_dir="../tmp",
-        endpoint="https://hf-mirror.com",
+        resume_download=True,
     )
 
 

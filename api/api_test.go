@@ -85,7 +85,7 @@ func TestApi_Dataset(t *testing.T) {
 		return
 	}
 
-	assert(t, sha256, "59ce09415ad8aa45a9e34f88cec2548aeb9de9a73fcda9f6b33a86a065f32b90")
+	assert(t, sha256, "abdfc9f83b1103b502924072460d4c92f277c9b49c313cef3e48cfcf7428e125")
 }
 
 func TestApi_Model(t *testing.T) {

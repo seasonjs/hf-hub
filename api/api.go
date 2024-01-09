@@ -29,18 +29,12 @@ const (
 )
 
 type Cache struct {
-	path string
+	path   string
+	resume bool
 }
 
-func NewCache(path string) *Cache {
-	//if !filepath.IsAbs(path) {
-	//	path, err := filepath.Abs(path)
-	//	if err != nil {
-	//		return nil, err
-	//	}
-	//	return &Cache{path: path}, nil
-	//}
-	return &Cache{path: path}
+func NewCache(path string, resume bool) *Cache {
+	return &Cache{path: path, resume: resume}
 }
 
 func DefaultCache() (*Cache, error) {
@@ -54,7 +48,7 @@ func DefaultCache() (*Cache, error) {
 		homePath = filepath.Join(homePath, ".cache", "huggingface")
 	}
 	cachePath := filepath.Join(homePath, "hub")
-	return NewCache(cachePath), nil
+	return NewCache(cachePath, true), nil
 }
 
 func (c *Cache) Path() string {
@@ -67,9 +61,8 @@ func (c *Cache) TokenPath() string {
 
 func (c *Cache) Token() (string, error) {
 	tokenPath := c.TokenPath()
-
 	if _, err := os.Stat(tokenPath); os.IsNotExist(err) {
-		log.Println("Token file not found")
+		log.Println("auth token file not found")
 		return "", nil
 	}
 
@@ -100,18 +93,28 @@ func (c *Cache) Space(modelId string) *CacheRepo {
 	return c.Repo(NewRepo(modelId, Space))
 }
 
-func (c *Cache) TempPath() (string, error) {
+func (c *Cache) TempPath(filename string) (string, error) {
 	path := filepath.Join(c.path, "tmp")
 	err := os.MkdirAll(path, os.ModePerm)
 	if err != nil {
 		return "", err
 	}
-	path = filepath.Join(path, randStr(7))
+
+	if len(filename) > 0 {
+		if c.resume {
+			path = filepath.Join(path, filename+".income")
+		} else {
+			path = filepath.Join(path, filename+randStr(7))
+		}
+	} else {
+		path = filepath.Join(path, randStr(7))
+	}
+
 	return path, nil
 }
 
 func (c *Cache) Clone() *Cache {
-	newCache := NewCache(c.path)
+	newCache := NewCache(c.path, c.resume)
 	return newCache
 }
 
@@ -269,6 +272,7 @@ type ApiBuilder struct {
 	parallelFailures uint64
 	maxRetries       uint64
 	progress         bool
+	headers          http.Header
 }
 
 func NewApiBuilder() (*ApiBuilder, error) {
@@ -292,14 +296,12 @@ func (b *ApiBuilder) FromCache(cache *Cache) (*ApiBuilder, error) {
 	}
 
 	token, err := cache.Token()
-
 	if err != nil {
 		return nil, err
 	}
 
 	return &ApiBuilder{
-		endpoint: "https://huggingface.co",
-		//"{endpoint}/{repo_id}/resolve/{revision}/{filename}"
+		endpoint:    "https://huggingface.co",
 		urlTemplate: "{{.Endpoint}}/{{.RepoId}}/resolve/{{.Revision}}/{{.Filename}}",
 		cache:       cache,
 		token:       token,
@@ -318,7 +320,13 @@ func (b *ApiBuilder) WithProgress(progress bool) *ApiBuilder {
 }
 
 func (b *ApiBuilder) WithCacheDir(cacheDir string) *ApiBuilder {
-	cache := NewCache(cacheDir)
+	cache := NewCache(cacheDir, b.cache.resume)
+	b.cache = cache
+	return b
+}
+
+func (b *ApiBuilder) WithResume(resume bool) *ApiBuilder {
+	cache := NewCache(b.cache.path, resume)
 	b.cache = cache
 	return b
 }
@@ -391,6 +399,7 @@ type Api struct {
 	client              *http.Client
 	noCDNRedirectClient *http.Client
 	progress            bool
+	meta                *Metadata
 }
 
 func NewApi() (*Api, error) {
@@ -463,19 +472,21 @@ func (a *Api) metadata(url string) (*Metadata, error) {
 		return nil, err
 	}
 
-	return &Metadata{
+	a.meta = &Metadata{
 		commitHash: commitHash,
 		etag:       etag,
 		size:       size,
-	}, nil
+	}
+	return a.meta, nil
 }
+
 func (a *Api) downloadTempFile(url string, progressbar *progressbar.ProgressBar) (string, error) {
-	filename, err := a.cache.TempPath()
+	filename, err := a.cache.TempPath(a.meta.etag)
 	if err != nil {
 		return "", err
 	}
 
-	file, err := os.Create(filename)
+	file, err := os.OpenFile(filename, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
 	if err != nil {
 		return "", err
 	}
@@ -487,6 +498,15 @@ func (a *Api) downloadTempFile(url string, progressbar *progressbar.ProgressBar)
 	}
 
 	req.Header = a.headers.Clone()
+
+	stat, _ := file.Stat()
+	if stat.Size() > 0 {
+		if a.meta.size > uint64(stat.Size()) {
+			progressbar.Set64(stat.Size())
+			req.Header.Add("Range", fmt.Sprintf("bytes=%d-", stat.Size()))
+		}
+	}
+
 	res, err := a.client.Do(req)
 	if err != nil {
 		return "", err
@@ -505,8 +525,9 @@ func (a *Api) downloadTempFile(url string, progressbar *progressbar.ProgressBar)
 		return "", err
 	}
 
-	return filename, nil
+	return file.Name(), nil
 }
+
 func (a *Api) Repo(rep *Repo) *ApiRepo {
 	return NewApiRepo(a.Clone(), rep)
 }
@@ -614,6 +635,8 @@ func (r *ApiRepo) Download(filename string) (string, error) {
 			int64(metadata.size),
 			progressbar.OptionSetDescription(message),
 			progressbar.OptionUseANSICodes(useANSICodes),
+			progressbar.OptionSetPredictTime(true),
+			progressbar.OptionShowBytes(true),
 		)
 	}
 
