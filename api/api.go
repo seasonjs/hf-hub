@@ -5,6 +5,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -273,6 +274,7 @@ type ApiBuilder struct {
 	maxRetries       uint64
 	progress         bool
 	headers          http.Header
+	context          context.Context
 }
 
 func NewApiBuilder() (*ApiBuilder, error) {
@@ -306,6 +308,7 @@ func (b *ApiBuilder) FromCache(cache *Cache) (*ApiBuilder, error) {
 		cache:       cache,
 		token:       token,
 		progress:    true,
+		context:     context.Background(),
 	}, nil
 }
 
@@ -333,6 +336,11 @@ func (b *ApiBuilder) WithResume(resume bool) *ApiBuilder {
 
 func (b *ApiBuilder) WithToken(token string) *ApiBuilder {
 	b.token = token
+	return b
+}
+
+func (b *ApiBuilder) WithContext(context context.Context) *ApiBuilder {
+	b.context = context
 	return b
 }
 
@@ -381,6 +389,7 @@ func (b *ApiBuilder) Build() *Api {
 		client:              client,
 		noCDNRedirectClient: noCDNRedirectClient,
 		progress:            b.progress,
+		context:             b.context,
 	}
 
 }
@@ -400,6 +409,7 @@ type Api struct {
 	noCDNRedirectClient *http.Client
 	progress            bool
 	meta                *Metadata
+	context             context.Context
 }
 
 func NewApi() (*Api, error) {
@@ -412,7 +422,7 @@ func NewApi() (*Api, error) {
 }
 
 func (a *Api) metadata(url string) (*Metadata, error) {
-	req, err := http.NewRequest(http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(a.context, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -446,7 +456,7 @@ func (a *Api) metadata(url string) (*Metadata, error) {
 	if 300 <= res.StatusCode && res.StatusCode <= 400 {
 		location := res.Header.Get("Location")
 
-		req, err = http.NewRequest(http.MethodGet, location, nil)
+		req, err = http.NewRequestWithContext(a.context, http.MethodGet, location, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -492,7 +502,7 @@ func (a *Api) downloadTempFile(url string, progressbar *progressbar.ProgressBar)
 	}
 	defer file.Close()
 
-	req, err := http.NewRequest(http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(a.context, http.MethodGet, url, nil)
 	if err != nil {
 		return "", err
 	}
