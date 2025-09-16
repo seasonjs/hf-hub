@@ -502,7 +502,9 @@ func (a *Api) downloadTempFile(url string, progressbar *progressbar.ProgressBar)
 	stat, _ := file.Stat()
 	if stat.Size() > 0 {
 		if a.meta.size > uint64(stat.Size()) {
-			progressbar.Set64(stat.Size())
+			if progressbar != nil {
+				progressbar.Set64(stat.Size())
+			}
 			req.Header.Add("Range", fmt.Sprintf("bytes=%d-", stat.Size()))
 		}
 	}
